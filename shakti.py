@@ -13,9 +13,11 @@ import random
 import time
 from expansion import expand_keywords
 from scraper import download_images
-from captioner import generate_captions
+from captioner import generate_caption, load_blip_model
 from exporter import export_to_json, write_summary
-from utils import ensure_dirs
+from utils import ensure_dirs, is_valid_image
+import threading
+import queue
 
 OUTPUT_ROOT = 'output'
 DATASET_DIR = os.path.join(OUTPUT_ROOT, 'dataset')
@@ -32,6 +34,8 @@ RES_OPTIONS = {
     "5": (512, 512),
     "6": None
 }
+
+BATCH_SIZE = 300
 
 # --- Keyword Expansion ---
 def expand_keywords(prompt, n_variations=15):
@@ -66,15 +70,6 @@ def ensure_dirs(image_dir, clear_images=False):
             file_path = os.path.join(image_dir, fname)
             if os.path.isfile(file_path):
                 os.remove(file_path)
-
-def is_valid_image(file_path):
-    try:
-        with Image.open(file_path) as img:
-            img.verify()
-        ext = os.path.splitext(file_path)[1].lower()
-        return ext in ['.jpg', '.jpeg', '.png']
-    except Exception:
-        return False
 
 def hash_file(file_path):
     hasher = hashlib.md5()
@@ -229,21 +224,6 @@ def resize_images(image_dir, resolution):
                 print(f"Failed to resize {fname}: {e}")
 
 # --- Caption Generation ---
-def load_blip_model():
-    print("Loading BLIP model (may take a while the first time)...")
-    processor = BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-base")
-    model = BlipForConditionalGeneration.from_pretrained("Salesforce/blip-image-captioning-base")
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    model = model.to(device)
-    return processor, model, device
-
-def generate_caption(image_path, processor, model, device):
-    raw_image = Image.open(image_path).convert('RGB')
-    inputs = processor(raw_image, return_tensors="pt").to(device)
-    out = model.generate(**inputs)
-    caption = processor.decode(out[0], skip_special_tokens=True)
-    return caption
-
 def generate_captions_file():
     processor, model, device = load_blip_model()
     data = []
@@ -290,29 +270,71 @@ def get_user_input():
 # --- Main ---
 def main():
     print("\n==== Shakti EPIC: Universal Smart Dataset Generator ====")
-    # Ensure output and dataset/images folders exist and are cleared
     os.makedirs(OUTPUT_ROOT, exist_ok=True)
     ensure_dirs(image_dir=IMAGES_DIR, clear_images=True)
     prompt, num_images, resize_size = get_user_input()
     print("\nExpanding keywords...")
     keywords = expand_keywords(prompt, n_variations=18)
     print(f"Keyword variations: {keywords}")
-    print("\nStarting image download...")
+    print("\nStarting image download and captioning (in parallel)...")
     t0 = time.time()
-    stats = download_images(keywords, num_images, IMAGES_DIR, resize_size)
+
+    # Prepare captioning thread
+    img_queue = queue.Queue()
+    caption_dict = {}
+    stop_event = threading.Event()
+    processor, model, device = load_blip_model()
+    gpu_status = (device == "cuda")
+    caption_thread = threading.Thread(target=threaded_caption_worker, args=(img_queue, caption_dict, stop_event, processor, model, device))
+    caption_thread.start()
+
+    # Download images in batches, prompt user after each batch
+    stats = {kw: 0 for kw in keywords}
+    downloaded = set()
+    total_downloaded = 0
+    batch_num = 0
+    for batch_start in range(0, num_images, BATCH_SIZE):
+        batch_end = min(batch_start + BATCH_SIZE, num_images)
+        batch_target = batch_end - batch_start
+        print(f"\nDownloading images {batch_start+1} to {batch_end}...")
+        batch_stats = download_images(keywords, batch_target, IMAGES_DIR, resize_size)
+        for k, v in batch_stats.items():
+            stats[k] += v
+        # Enqueue new images for captioning
+        new_files = [f for f in sorted(os.listdir(IMAGES_DIR)) if is_valid_image(os.path.join(IMAGES_DIR, f)) and f not in downloaded]
+        for fname in new_files:
+            img_queue.put(fname)
+            downloaded.add(fname)
+        total_downloaded = len(downloaded)
+        print(f"Downloaded {total_downloaded} images so far.")
+        # Prompt user after each batch except the last
+        if total_downloaded < num_images:
+            while True:
+                user_choice = input(f"\n{total_downloaded} images downloaded. Do you want to stop and make a dataset now? (yes/no): ").strip().lower()
+                if user_choice in ("yes", "no", "y", "n"):
+                    break
+                else:
+                    print("Please enter yes or no.")
+            if user_choice.startswith('y'):
+                print("Stopping download. Finalizing dataset...")
+                break
+    # Signal caption thread to finish
+    stop_event.set()
+    img_queue.join()
+    caption_thread.join()
     t1 = time.time()
-    total_images = sum(stats.values())
-    print(f"\nDownloaded {total_images} images. Starting caption generation...")
-    gpu_status, caption_time = generate_captions(IMAGES_DIR, CAPTIONS_FILE, use_tqdm=True)
-    t2 = time.time()
+    # Write captions.txt
+    data = [{'image': fname, 'caption': caption_dict.get(fname, "No caption available.")} for fname in sorted(downloaded)]
+    pd.DataFrame(data).to_csv(CAPTIONS_FILE, sep='\t', index=False, header=False)
+    print(f"Captions saved to {CAPTIONS_FILE}")
     print("\nWriting summary...")
     write_summary(SUMMARY_FILE, {
         'prompt': prompt,
         'keywords': keywords,
         'stats': stats,
-        'total_images': total_images,
+        'total_images': total_downloaded,
         'resolution': f"{resize_size[0]}x{resize_size[1]}" if resize_size else 'original',
-        'time': t2 - t0,
+        'time': t1 - t0,
         'gpu_status': gpu_status,
         'author': 'Akshit'
     })
@@ -326,6 +348,21 @@ def main():
     if export_json.startswith('y'):
         export_to_json(CAPTIONS_FILE, JSON_FILE)
     print(f"\nAll done! Your dataset is ready in the '{DATASET_DIR}/' folder (inside 'output/').")
+
+def threaded_caption_worker(img_queue, caption_dict, stop_event, processor, model, device):
+    while not stop_event.is_set() or not img_queue.empty():
+        try:
+            fname = img_queue.get(timeout=1)
+        except queue.Empty:
+            continue
+        img_path = os.path.join(IMAGES_DIR, fname)
+        try:
+            caption = generate_caption(img_path, processor, model, device)
+        except Exception as e:
+            print(f"Failed to caption {fname}: {e}")
+            caption = "No caption available."
+        caption_dict[fname] = caption
+        img_queue.task_done()
 
 if __name__ == "__main__":
     main() 
