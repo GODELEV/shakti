@@ -1,5 +1,8 @@
+icrawler
+duckduckgo-search
+requests
+pillow
 torch
 transformers
-pillow
-icrawler
+tqdm
 pandas 
